@@ -975,7 +975,18 @@ class TelegramBackup:
                 if preserve_order:
                     # STRICT ORDER: Wait for the oldest task
                     oldest_task = pending_tasks.pop(0)
-                    await _append_and_commit(await oldest_task)
+
+                    # Wait without raising exceptions automatically
+                    await asyncio.wait([oldest_task])
+
+                    if oldest_task.cancelled():
+                        logger.warning("Task was cancelled, dropping.")
+                    elif oldest_task.exception():
+                        logger.error(f"Task fatally failed: {oldest_task.exception()}")
+                    else:
+                        msg_data = oldest_task.result()
+                        if msg_data is not None:
+                            await _append_and_commit(msg_data)
                 else:
                     # FASTEST FIRST: Wait for ANY task that finishes first
                     done, pending = await asyncio.wait(
@@ -985,25 +996,46 @@ class TelegramBackup:
                     # Update the queue: keep only the pending tasks
                     pending_tasks = list(pending)
 
-                    # Save the results of the completed tasks
-                    # (there could be multiple if they finished simultaneously)
+                    # Save the results of the completed tasks securely
                     for completed_task in done:
-                        await _append_and_commit(completed_task.result())
+                        if completed_task.cancelled():
+                            logger.warning("Task was cancelled, dropping.")
+                            continue
 
-            # Create a background task for processing, allowing concurrent execution
-            task = asyncio.create_task(self._process_message(message, chat_id))
+                        exc = completed_task.exception()
+                        if exc:
+                            logger.error(f"Task fatally failed with {type(exc).__name__}: {exc}")
+                            continue
+
+                        msg_data = completed_task.result()
+                        if msg_data is not None:
+                            await _append_and_commit(msg_data)
+
+            # Create a background task for processing, allowing concurrent execution with timeout 500 sec
+            coro = asyncio.wait_for(self._process_message(message, chat_id), timeout=500)
+            task = asyncio.create_task(coro)
             pending_tasks.append(task)
 
         # After the loop finishes, await and commit all remaining pending tasks in order
         if pending_tasks:
-            if preserve_order:
-                # Wait in sequential order
-                for task in pending_tasks:
-                    await _append_and_commit(await task)
-            else:
-                # Wait as they complete (whichever finishes first among the remaining ones)
-                for completed_task in asyncio.as_completed(pending_tasks):
-                    await _append_and_commit(await completed_task)
+            # Waiting remaining tasks
+            done, _ = await asyncio.wait(pending_tasks, return_when=asyncio.ALL_COMPLETED)
+
+            tasks_to_process = pending_tasks if preserve_order else done
+
+            for completed_task in tasks_to_process:
+                if completed_task.cancelled():
+                    logger.warning("Task was cancelled, dropping.")
+                    continue
+
+                exc = completed_task.exception()
+                if exc:
+                    logger.error(f"Task fatally failed with {type(exc).__name__}: {exc}")
+                    continue
+
+                msg_data = completed_task.result()
+                if msg_data is not None:
+                    await _append_and_commit(msg_data)
 
         # Flush remaining messages
         if batch_data:
