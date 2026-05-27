@@ -120,6 +120,12 @@ class Config:
         # Lower = better crash recovery, higher = fewer DB writes
         self.checkpoint_interval = max(1, int(os.getenv("CHECKPOINT_INTERVAL", "1")))
 
+        # limit parallel tasks
+        self.concurrency_limit = max(1, int(os.getenv("CONCURRENCY_LIMIT", "4")))
+
+        # check order
+        self.preserve_order = os.getenv("PRESERVE_ORDER", "true").lower() == "true"
+
         # Database Configuration
         # Timeout for SQLite operations (seconds).
         # Increase this if you experience "database is locked" errors (e.g., on Unraid/slow disks).

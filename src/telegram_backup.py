@@ -935,14 +935,18 @@ class TelegramBackup:
         batches_since_checkpoint = 0
         running_max_id = last_message_id
 
-        async for message in iter_messages_with_flood_retry(self.client, entity, min_id=last_message_id, reverse=True):
-            running_max_id = max(running_max_id, message.id)
+        # Limit for concurrent processing
+        concurrency_limit = self.config.concurrency_limit
+        pending_tasks = []
 
-            # Skip messages belonging to excluded forum topics
-            if self.config.should_skip_topic(chat_id, extract_topic_id(message)):
-                continue
+        # preserve order flag
+        preserve_order = self.config.preserve_order
 
-            msg_data = await self._process_message(message, chat_id)
+        # Local helper to append processed data and handle commits/checkpoints
+        async def _append_and_commit(msg_data):
+
+            nonlocal batch_data, grand_total, uncheckpointed_count, batches_since_checkpoint
+
             batch_data.append(msg_data)
 
             if len(batch_data) >= batch_size:
@@ -959,6 +963,47 @@ class TelegramBackup:
                     batches_since_checkpoint = 0
 
                 batch_data = []
+
+        async for message in iter_messages_with_flood_retry(self.client, entity, min_id=last_message_id, reverse=True):
+            running_max_id = max(running_max_id, message.id)
+
+            # Skip messages belonging to excluded forum topics
+            if self.config.should_skip_topic(chat_id, extract_topic_id(message)):
+                continue
+
+            if len(pending_tasks) >= concurrency_limit:
+                if preserve_order:
+                    # STRICT ORDER: Wait for the oldest task
+                    oldest_task = pending_tasks.pop(0)
+                    await _append_and_commit(await oldest_task)
+                else:
+                    # FASTEST FIRST: Wait for ANY task that finishes first
+                    done, pending = await asyncio.wait(
+                        pending_tasks,
+                        return_when=asyncio.FIRST_COMPLETED
+                    )
+                    # Update the queue: keep only the pending tasks
+                    pending_tasks = list(pending)
+
+                    # Save the results of the completed tasks
+                    # (there could be multiple if they finished simultaneously)
+                    for completed_task in done:
+                        await _append_and_commit(completed_task.result())
+
+            # Create a background task for processing, allowing concurrent execution
+            task = asyncio.create_task(self._process_message(message, chat_id))
+            pending_tasks.append(task)
+
+        # After the loop finishes, await and commit all remaining pending tasks in order
+        if pending_tasks:
+            if preserve_order:
+                # Wait in sequential order
+                for task in pending_tasks:
+                    await _append_and_commit(await task)
+            else:
+                # Wait as they complete (whichever finishes first among the remaining ones)
+                for completed_task in asyncio.as_completed(pending_tasks):
+                    await _append_and_commit(await completed_task)
 
         # Flush remaining messages
         if batch_data:
